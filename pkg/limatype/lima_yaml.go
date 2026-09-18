@@ -330,6 +330,10 @@ type Network struct {
 	MACAddress string  `yaml:"macAddress,omitempty" json:"macAddress,omitempty"`
 	Interface  string  `yaml:"interface,omitempty" json:"interface,omitempty"`
 	Metric     *uint32 `yaml:"metric,omitempty" json:"metric,omitempty"`
+	// MTU of the guest interface. Requires a socket_vmnet that can carry it:
+	// the segment's MTU is vmnet's, and a guest advertising more than the
+	// segment carries loses every large frame silently.
+	MTU *uint32 `yaml:"mtu,omitempty" json:"mtu,omitempty"`
 }
 
 type HostResolver struct {

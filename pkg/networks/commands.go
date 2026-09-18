@@ -114,6 +114,14 @@ func (c *Config) StartCmd(name, daemon string) string {
 		case ModeHost, ModeShared:
 			cmd += fmt.Sprintf(" --vmnet-gateway=%s --vmnet-dhcp-end=%s --vmnet-mask=%s",
 				nw.Gateway, nw.DHCPEnd, nw.NetMask)
+			// Only when asked. An unset MTU keeps the command line identical to
+			// what every existing socket_vmnet accepts; a set one requires a
+			// daemon that knows the flag, and failing loudly on an old one is
+			// better than a segment quietly staying at 1500 while guests are
+			// told otherwise.
+			if nw.MTU > 0 {
+				cmd += fmt.Sprintf(" --vmnet-mtu=%d", nw.MTU)
+			}
 		}
 		cmd += " " + c.Sock(name)
 	default:

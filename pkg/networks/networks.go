@@ -37,4 +37,8 @@ type Network struct {
 	Gateway   net.IP `yaml:"gateway,omitempty" json:"gateway,omitempty"`     // only used by "user-v2", "host" and "shared" networks
 	DHCPEnd   net.IP `yaml:"dhcpEnd,omitempty" json:"dhcpEnd,omitempty"`     // default: same as Gateway, last byte is 254
 	NetMask   net.IP `yaml:"netmask,omitempty" json:"netmask,omitempty"`     // default: 255.255.255.0
+	// MTU of the segment, passed to socket_vmnet as --vmnet-mtu. Only "host"
+	// and "shared" modes; vmnet rejects it for "bridged". Unset leaves vmnet at
+	// its default of 1500.
+	MTU uint32 `yaml:"mtu,omitempty" json:"mtu,omitempty"`
 }

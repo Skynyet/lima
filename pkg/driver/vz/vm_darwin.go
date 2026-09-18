@@ -387,17 +387,35 @@ func attachSerialPort(inst *limatype.Instance, config *vz.VirtualMachineConfigur
 }
 
 func newVirtioFileNetworkDeviceConfiguration(file *os.File, macStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
-	return newVirtioFileNetworkDeviceConfigurationWithMTU(file, macStr, 0)
+	return newVirtioFileNetworkDeviceConfigurationMTU(file, macStr, 0)
 }
 
 func newVirtioFileNetworkDeviceConfigurationWithMTU(file *os.File, macStr string, mtu int) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	return newVirtioFileNetworkDeviceConfigurationMTU(file, macStr, uint32(mtu))
+}
+
+// A nil MTU means "leave it alone", which is what every existing instance has.
+func mtuOf(nw limatype.Network) uint32 {
+	if nw.MTU == nil {
+		return 0
+	}
+	return *nw.MTU
+}
+
+// A nil MTU preserves the existing attachment behavior. user-v2's management
+// network uses a netstack fixed at 1500.
+func newVirtioFileNetworkDeviceConfigurationMTU(file *os.File, macStr string, mtu uint32) (*vz.VirtioNetworkDeviceConfiguration, error) {
 	fileAttachment, err := vz.NewFileHandleNetworkDeviceAttachment(file)
 	if err != nil {
 		return nil, err
 	}
-	if mtu != 0 {
-		if err := fileAttachment.SetMaximumTransmissionUnit(mtu); err != nil {
-			return nil, fmt.Errorf("set VZ file-handle network MTU to %d: %w", mtu, err)
+	if mtu > 0 {
+		// VZFileHandleNetworkDeviceAttachment has carried this since macOS 13
+		// and Lima has never called it. It is the only attachment type with the
+		// property; NAT and bridged have none, which is why those modes reject
+		// an MTU rather than ignoring it.
+		if err := fileAttachment.SetMaximumTransmissionUnit(int(mtu)); err != nil {
+			return nil, fmt.Errorf("failed to set MTU %d on the network attachment: %w", mtu, err)
 		}
 	}
 	return newVirtioNetworkDeviceConfiguration(fileAttachment, macStr)
@@ -507,7 +525,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 				if err != nil {
 					return err
 				}
-				networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
+				networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
 				if err != nil {
 					return err
 				}
@@ -544,7 +562,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 					if err != nil {
 						return err
 					}
-					networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
+					networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
 					if err != nil {
 						return err
 					}
@@ -556,7 +574,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 			if err != nil {
 				return err
 			}
-			networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
+			networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
 			if err != nil {
 				return err
 			}
