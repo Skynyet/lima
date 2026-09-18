@@ -387,11 +387,35 @@ func attachSerialPort(inst *limatype.Instance, config *vz.VirtualMachineConfigur
 }
 
 func newVirtioFileNetworkDeviceConfiguration(file *os.File, macStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	return newVirtioFileNetworkDeviceConfigurationWithMTU(file, macStr, 0)
+}
+
+func newVirtioFileNetworkDeviceConfigurationWithMTU(file *os.File, macStr string, mtu int) (*vz.VirtioNetworkDeviceConfiguration, error) {
 	fileAttachment, err := vz.NewFileHandleNetworkDeviceAttachment(file)
 	if err != nil {
 		return nil, err
 	}
+	if mtu != 0 {
+		if err := fileAttachment.SetMaximumTransmissionUnit(mtu); err != nil {
+			return nil, fmt.Errorf("set VZ file-handle network MTU to %d: %w", mtu, err)
+		}
+	}
 	return newVirtioNetworkDeviceConfiguration(fileAttachment, macStr)
+}
+
+func shmemBusExperiment() (controlSock string, mtu int, enabled bool, err error) {
+	controlSock = os.Getenv("LIMA_VZ_SHMEM_BUS_CONTROL")
+	if controlSock == "" {
+		return "", 0, false, nil
+	}
+	mtu = 1500
+	if text := os.Getenv("LIMA_VZ_SHMEM_BUS_MTU"); text != "" {
+		mtu, err = strconv.Atoi(text)
+		if err != nil || mtu < 1500 || mtu > 65535 {
+			return "", 0, false, fmt.Errorf("invalid LIMA_VZ_SHMEM_BUS_MTU %q (want 1500..65535)", text)
+		}
+	}
+	return controlSock, mtu, true, nil
 }
 
 func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, macStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
@@ -413,6 +437,10 @@ func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, 
 
 func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.VirtualMachineConfiguration) error {
 	var configurations []*vz.VirtioNetworkDeviceConfiguration
+	busControl, busMTU, busEnabled, err := shmemBusExperiment()
+	if err != nil {
+		return err
+	}
 
 	// Configure default usernetwork with limayaml.MACAddress(inst.Dir) for eth0 interface
 	firstUsernetIndex := limayaml.FirstUsernetIndex(inst.Config)
@@ -487,6 +515,19 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 			} else {
 				if runtime.GOOS != "darwin" {
 					return fmt.Errorf("networks.yaml '%s' configuration is only supported on macOS right now", nw.Lima)
+				}
+				if busEnabled {
+					clientFile, err := DialShmemBus(ctx, busControl, nw.MACAddress)
+					if err != nil {
+						return err
+					}
+					networkConfig, err := newVirtioFileNetworkDeviceConfigurationWithMTU(clientFile, nw.MACAddress, busMTU)
+					if err != nil {
+						return err
+					}
+					logrus.Infof("Attached VZ network %q to in-process shared-memory bus %q (MTU %d)", nw.Lima, busControl, busMTU)
+					configurations = append(configurations, networkConfig)
+					continue
 				}
 				socketVMNetOk, err := nwCfg.IsDaemonInstalled(networks.SocketVMNet)
 				if err != nil {
