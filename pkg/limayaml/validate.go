@@ -532,6 +532,9 @@ func validateNetwork(y *limatype.LimaYAML) error {
 			if nw.VZNAT != nil && *nw.VZNAT {
 				errs = errors.Join(errs, fmt.Errorf("field `%s.lima` and field `%s.vzNAT` are mutually exclusive", field, field))
 			}
+			if nw.MTU != nil {
+				errs = errors.Join(errs, validateNetworkMTU(field, *nw.MTU, nw.Lima, nwCfg.Networks[nw.Lima]))
+			}
 		case nw.Socket != "":
 			if nw.VZNAT != nil && *nw.VZNAT {
 				errs = errors.Join(errs, fmt.Errorf("field `%s.socket` and field `%s.vzNAT` are mutually exclusive", field, field))
@@ -548,8 +551,17 @@ func validateNetwork(y *limatype.LimaYAML) error {
 			if nw.Socket != "" {
 				errs = errors.Join(errs, fmt.Errorf("field `%s.vzNAT` and field `%s.socket` are mutually exclusive", field, field))
 			}
+			// VZNATNetworkDeviceAttachment carries no MTU property -- only the
+			// file-handle attachment does -- so the field would be accepted and
+			// then ignored, which is indistinguishable from it not working.
+			if nw.MTU != nil {
+				errs = errors.Join(errs, fmt.Errorf("field `%s.mtu` is not supported with field `%s.vzNAT`: the VZ NAT attachment has no MTU property", field, field))
+			}
 		default:
 			errs = errors.Join(errs, fmt.Errorf("field `%s.lima` or  field `%s.socket must be set", field, field))
+		}
+		if nw.MTU != nil && (*nw.MTU < networks.MinMTU || *nw.MTU > networks.MaxMTU) {
+			errs = errors.Join(errs, fmt.Errorf("field `%s.mtu` must be between %d and %d, but is %d", field, networks.MinMTU, networks.MaxMTU, *nw.MTU))
 		}
 		if nw.MACAddress != "" {
 			hw, err := net.ParseMAC(nw.MACAddress)
@@ -581,6 +593,38 @@ func validateNetwork(y *limatype.LimaYAML) error {
 
 // validateParamIsUsed checks if the keys in the `param` field are used in any script, probe, copyToHost, or portForward.
 // It should be called before the `y` parameter is passed to FillDefault() that execute template.
+// validateNetworkMTU decides whether a guest `mtu` is usable on the
+// networks.yaml network the instance names. It takes the network rather than
+// reading networks.yaml so it can be exercised without one on disk.
+//
+// The two refusals are for silent failures, not for errors that would surface
+// on their own. "user-v2" is the sharper of them: unlike vzNAT the MTU really
+// is applied, to an attachment whose gvisor netstack is fixed at 1500, and the
+// instance then boots perfectly and refuses SSH -- which reads as a broken
+// image rather than a broken network.
+//
+// The last check is the one Lima is uniquely able to make: it knows the guest
+// MTU and the segment MTU, and a guest above its segment loses every large
+// frame with nothing in any log. Below the segment stays legal; that is a
+// real thing to configure when testing path-MTU discovery or a constrained
+// link.
+func validateNetworkMTU(field string, mtu uint32, name string, nw networks.Network) error {
+	switch nw.Mode {
+	case networks.ModeUserV2:
+		return fmt.Errorf("field `%s.mtu` is not supported on network %#q: %#q runs on a gvisor netstack fixed at %d", field, name, networks.ModeUserV2, networks.DefaultMTU)
+	case networks.ModeBridged:
+		return fmt.Errorf("field `%s.mtu` is not supported on network %#q: vmnet refuses an MTU in %#q mode, so the guest would sit above a segment that stays at %d", field, name, networks.ModeBridged, networks.DefaultMTU)
+	}
+	segment := uint32(networks.DefaultMTU)
+	if nw.MTU != 0 {
+		segment = nw.MTU
+	}
+	if mtu > segment {
+		return fmt.Errorf("field `%s.mtu` is %d, but network %#q carries %d: a guest above its segment loses every large frame silently; set `mtu` on the network in networks.yaml as well", field, mtu, name, segment)
+	}
+	return nil
+}
+
 func validateParamIsUsed(y *limatype.LimaYAML) error {
 	for key := range y.Param {
 		re, err := regexp.Compile(`{{[^}]*\.Param\.` + key + `[^}]*}}|\bPARAM_` + key + `\b`)

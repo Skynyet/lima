@@ -45,6 +45,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("invalid interface %#q for network %#q: %w", nw.Interface, name, err)
 			}
 		}
+		if err := validateMTU(name, nw); err != nil {
+			return err
+		}
 	}
 
 	// validate all paths.* values
@@ -80,6 +83,24 @@ func (c *Config) Validate() error {
 	}
 	if socketVMNetNotFound {
 		return fmt.Errorf("networks.yaml: %#q (`paths.socketVMNet`) has to be installed", pathsMap["socketVMNet"])
+	}
+	return nil
+}
+
+// validateMTU rejects combinations the network cannot carry. Bridged mode
+// cannot set the vmnet segment MTU, and user-v2's netstack is fixed at 1500.
+func validateMTU(name string, nw Network) error {
+	if nw.MTU == 0 {
+		return nil
+	}
+	if nw.MTU < MinMTU || nw.MTU > MaxMTU {
+		return fmt.Errorf("invalid mtu %d for network %#q: must be between %d and %d", nw.MTU, name, MinMTU, MaxMTU)
+	}
+	switch nw.Mode {
+	case ModeBridged:
+		return fmt.Errorf("field `mtu` is not supported for network %#q: vmnet refuses an MTU in %#q mode, so it would be dropped from the daemon's command line", name, ModeBridged)
+	case ModeUserV2:
+		return fmt.Errorf("field `mtu` is not supported for network %#q: %#q runs on a gvisor netstack fixed at %d", name, ModeUserV2, DefaultMTU)
 	}
 	return nil
 }

@@ -11,6 +11,8 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/lima-vm/lima/v2/pkg/limatype"
+	"github.com/lima-vm/lima/v2/pkg/networks"
+	"github.com/lima-vm/lima/v2/pkg/ptr"
 	"github.com/lima-vm/lima/v2/pkg/version"
 )
 
@@ -566,4 +568,52 @@ osOpts:
 			}
 		})
 	}
+}
+
+func TestValidateNetworkMTU(t *testing.T) {
+	// Refused: the MTU is applied to an attachment whose gvisor netstack is
+	// fixed at 1500, and the instance then boots and refuses SSH.
+	err := validateNetworkMTU("networks[0]", 9000, "user-v2", networks.Network{Mode: networks.ModeUserV2})
+	assert.ErrorContains(t, err, "gvisor netstack")
+
+	// Refused: vmnet takes no MTU in bridged mode, so the segment stays at 1500
+	// while the guest interface is raised above it.
+	err = validateNetworkMTU("networks[0]", 9000, "bridged", networks.Network{Mode: networks.ModeBridged})
+	assert.ErrorContains(t, err, "not supported")
+
+	// The case only Lima can catch: both numbers are known here.
+	err = validateNetworkMTU("networks[0]", 9000, "shared", networks.Network{Mode: networks.ModeShared})
+	assert.ErrorContains(t, err, "carries 1500")
+	err = validateNetworkMTU("networks[0]", 9000, "shared", networks.Network{Mode: networks.ModeShared, MTU: 4000})
+	assert.ErrorContains(t, err, "carries 4000")
+
+	// Allowed: guest at the segment, and guest below it -- a constrained link or
+	// a path-MTU test is a real thing to configure.
+	assert.NilError(t, validateNetworkMTU("networks[0]", 9000, "shared", networks.Network{Mode: networks.ModeShared, MTU: 9000}))
+	assert.NilError(t, validateNetworkMTU("networks[0]", 1400, "shared", networks.Network{Mode: networks.ModeShared}))
+	assert.NilError(t, validateNetworkMTU("networks[0]", 9000, "host", networks.Network{Mode: networks.ModeHost, MTU: 9000}))
+}
+
+func TestValidateNetworkMTUFields(t *testing.T) {
+	// Range, at both ends.
+	err := validateNetwork(&limatype.LimaYAML{Networks: []limatype.Network{
+		{VZNAT: ptr.Of(true), MTU: ptr.Of(uint32(67))},
+	}})
+	assert.ErrorContains(t, err, "must be between 68 and 65535")
+	err = validateNetwork(&limatype.LimaYAML{Networks: []limatype.Network{
+		{VZNAT: ptr.Of(true), MTU: ptr.Of(uint32(65536))},
+	}})
+	assert.ErrorContains(t, err, "must be between 68 and 65535")
+
+	// vzNAT: the attachment has no MTU property, so an accepted field is an
+	// ignored one.
+	err = validateNetwork(&limatype.LimaYAML{Networks: []limatype.Network{
+		{VZNAT: ptr.Of(true), MTU: ptr.Of(uint32(9000))},
+	}})
+	assert.ErrorContains(t, err, "has no MTU property")
+
+	err = validateNetwork(&limatype.LimaYAML{Networks: []limatype.Network{
+		{VZNAT: ptr.Of(true)},
+	}})
+	assert.NilError(t, err)
 }
