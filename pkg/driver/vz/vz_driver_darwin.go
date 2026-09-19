@@ -326,6 +326,7 @@ func validateConfig(cfg *limatype.LimaYAML) error {
 			"MACAddress",
 			"Metric",
 			"Interface",
+			"MTU",
 		); len(unknown) > 0 {
 			logrus.Warnf("vmType %s: ignoring networks[%d]: %+v", *cfg.VMType, i, unknown)
 		}
