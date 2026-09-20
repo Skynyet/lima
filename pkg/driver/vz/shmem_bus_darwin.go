@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -19,9 +19,20 @@ import (
 
 const shmemBusMaxFrame = 16 * 1024
 
+const (
+	rejoinBackoffInitial = 100 * time.Millisecond
+	rejoinBackoffMax     = 2 * time.Second
+)
+
 // DialShmemBus connects VZ's datagram attachment to an in-process bus
 // participant. The socketpair is only the VZ file-handle edge: all payload
 // between participants crosses the shared mappings managed by dataplane.Peer.
+//
+// The peer-side descriptor is kept as the VM-lifetime anchor: when the control
+// lease ends while the VM is still running -- the daemon was restarted -- a
+// supervisor tears the participant fully down and rejoins through a fresh dup
+// of the anchor, and the guest's device never drops. Only the final close of
+// the anchor at VM teardown is what VZ observes as edge shutdown.
 func DialShmemBus(ctx context.Context, controlSock, macText string) (*os.File, error) {
 	peerEnd, vzEnd, err := createSockPair()
 	if err != nil {
@@ -37,45 +48,81 @@ func DialShmemBus(ctx context.Context, controlSock, macText string) (*os.File, e
 	if err != nil {
 		return fail(err)
 	}
-	peer, err := dataplane.Open(dataplane.Config{
+	cfg := dataplane.Config{
 		Control:  controlSock,
 		EdgeFD:   int(peerEnd.Fd()),
 		MAC:      mac,
 		MaxFrame: shmemBusMaxFrame,
-	})
+	}
+	peer, err := dataplane.Open(cfg)
 	if err != nil {
 		return fail(fmt.Errorf("join shared-memory bus %q: %w", controlSock, err))
 	}
-	// dataplane.Open duplicates EdgeFD. The local descriptor must not remain a
-	// second owner, otherwise VZ cannot observe edge shutdown.
-	_ = peerEnd.Close()
+	go superviseBus(ctx, peerEnd, peer, cfg)
 
-	var closeOnce sync.Once
-	closePeer := func() { closeOnce.Do(peer.Close) }
-	done := make(chan struct{})
-	go func() {
+	return vzEnd, nil
+}
+
+// superviseBus owns the participant and the anchor. Every join is a fresh
+// dataplane.Peer built on a fresh dup of the anchor, so no per-join state --
+// control channels, kqueue registrations, membership cache, mapped regions --
+// survives from a dead coordinator into a new one. The old peer is fully
+// closed before the new one opens; the edge never has two readers at once.
+func superviseBus(ctx context.Context, anchor *os.File, first *dataplane.Peer, cfg dataplane.Config) {
+	defer func() { _ = anchor.Close() }()
+	peer := first
+	for {
+		p := peer
+		stopped := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				p.Stop()
+			case <-stopped:
+			}
+		}()
 		stats, runErr := peer.Run()
-		if runErr != nil && ctx.Err() == nil {
-			logrus.WithError(runErr).Error("Shared-memory bus participant stopped")
-		} else {
+		close(stopped)
+		peer.Close()
+		if runErr == nil || ctx.Err() != nil {
 			logrus.WithFields(logrus.Fields{
 				"ingress_frames": stats.IngressFrames,
 				"egress_frames":  stats.EgressFrames,
 				"reserve_drops":  stats.ReserveDrops,
 			}).Debug("Shared-memory bus participant stopped")
+			return
 		}
-		closePeer()
-		close(done)
-	}()
-	go func() {
+		logrus.WithError(runErr).Warn("Shared-memory bus lease lost; rejoining")
+		next, ok := rejoin(ctx, cfg)
+		if !ok {
+			logrus.Debug("Shared-memory bus participant stopped")
+			return
+		}
+		peer = next
+	}
+}
+
+// rejoin retries dataplane.Open with capped exponential backoff until a
+// restarted coordinator has rebound its control path -- while it is down,
+// connect fails with ENOENT or ECONNREFUSED -- or the VM context ends.
+func rejoin(ctx context.Context, cfg dataplane.Config) (*dataplane.Peer, bool) {
+	backoff := rejoinBackoffInitial
+	for {
 		select {
 		case <-ctx.Done():
-			peer.Stop()
-		case <-done:
+			return nil, false
+		case <-time.After(backoff):
 		}
-	}()
-
-	return vzEnd, nil
+		peer, err := dataplane.Open(cfg)
+		if err == nil {
+			return peer, true
+		}
+		logrus.WithError(err).Debug("Shared-memory bus rejoin attempt failed")
+		backoff *= 2
+		if backoff > rejoinBackoffMax {
+			backoff = rejoinBackoffMax
+		}
+	}
 }
 
 func shmemBusMAC(text string) (uint64, error) {
