@@ -2,6 +2,7 @@
 package dataplane
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math/bits"
@@ -18,6 +19,9 @@ import (
 const claimRetries = 8
 
 type Config struct {
+	// Context bounds the join handshake. Nil keeps the historical behaviour of
+	// blocking until the coordinator answers or the connection fails.
+	Context    context.Context
 	Control    string
 	EdgeLocal  string
 	EdgeRemote string
@@ -106,7 +110,7 @@ func Open(cfg Config) (*Peer, error) {
 		_ = os.Remove(cfg.EdgeLocal)
 		return nil, err
 	}
-	c, err := busctl.JoinWithFlags(cfg.Control, cfg.MAC, cfg.PortFlags)
+	c, err := busctl.JoinWithContext(cfg.Context, cfg.Control, cfg.MAC, cfg.PortFlags)
 	if err != nil {
 		return fail(err)
 	}

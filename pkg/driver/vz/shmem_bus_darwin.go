@@ -49,6 +49,7 @@ func DialShmemBus(ctx context.Context, controlSock, macText string) (*os.File, e
 		return fail(err)
 	}
 	cfg := dataplane.Config{
+		Context:  ctx,
 		Control:  controlSock,
 		EdgeFD:   int(peerEnd.Fd()),
 		MAC:      mac,

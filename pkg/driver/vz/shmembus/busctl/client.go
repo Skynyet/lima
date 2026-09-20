@@ -1,6 +1,7 @@
 package busctl
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"syscall"
@@ -53,6 +54,18 @@ func Join(path string, mac uint64) (*Client, error) {
 // carries flags because a HELLO names no directory epoch yet; message width and
 // descriptor framing remain unchanged.
 func JoinWithFlags(path string, mac uint64, flags uint32) (*Client, error) {
+	return JoinWithContext(context.Background(), path, mac, flags)
+}
+
+// JoinWithContext is JoinWithFlags whose handshake the caller's context can
+// abort. An acceptor that answers the connection but never completes the
+// handshake would otherwise block the caller with no way out; cancelling the
+// context shuts the lease down, which is the same wakeup Interrupt uses on a
+// joined client, so the HELLO send and the read loop fail at once.
+func JoinWithContext(ctx context.Context, path string, mac uint64, flags uint32) (*Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if flags&^ring.PortFlagsMask != 0 {
 		return nil, fmt.Errorf("unknown port flags %#x", flags)
 	}
@@ -64,31 +77,63 @@ func JoinWithFlags(path string, mac uint64, flags uint32) (*Client, error) {
 		syscall.Close(sock)
 		return nil, fmt.Errorf("connect %s: %w", path, err)
 	}
+	stop := make(chan struct{})
+	stopDone := make(chan bool)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = syscall.Shutdown(sock, syscall.SHUT_RDWR)
+			stopDone <- true
+		case <-stop:
+			stopDone <- false
+		}
+	}()
+	// The watchdog owns the one shutdown of this lease: every return path
+	// waits for it, and a cancellation that won the race against a completed
+	// handshake is reported instead of returning a shut-down lease.
+	stopWatchdog := func() bool {
+		close(stop)
+		return <-stopDone
+	}
 	c := &Client{sock: sock, reader: newReader(), Peers: map[uint32]*Peer{}, DoorbellRx: -1}
 
 	if err := send(sock, Msg{Type: MsgHello, Version: Version, Port: PortNone, Bytes: mac,
 		Epoch: uint64(flags)}); err != nil {
+		stopWatchdog()
 		c.Close()
-		return nil, fmt.Errorf("hello: %w", err)
+		return nil, handshakeError(ctx, path, "hello", err)
 	}
 	for {
 		m, fd, ok, err := c.reader.read(sock)
 		if err != nil {
+			stopWatchdog()
 			c.Close()
-			return nil, err
+			return nil, handshakeError(ctx, path, "handshake", err)
 		}
 		if !ok {
 			continue // blocking socket, so this only happens on a partial read
 		}
 		if m.Type == MsgReady {
+			if stopWatchdog() {
+				c.Close()
+				return nil, handshakeError(ctx, path, "handshake", context.Canceled)
+			}
 			c.Epoch = m.Epoch
 			return c, nil
 		}
 		if err := c.install(m, fd); err != nil {
+			stopWatchdog()
 			c.Close()
-			return nil, err
+			return nil, handshakeError(ctx, path, "handshake", err)
 		}
 	}
+}
+
+func handshakeError(ctx context.Context, path, stage string, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s %s: %w: %w", stage, path, ctx.Err(), err)
+	}
+	return fmt.Errorf("%s %s: %w", stage, path, err)
 }
 
 // Event is something the coordinator told us after READY. The directory is
