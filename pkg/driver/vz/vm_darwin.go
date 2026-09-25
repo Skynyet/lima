@@ -409,12 +409,25 @@ func newVirtioFileNetworkDeviceConfigurationMTU(file *os.File, macStr string, mt
 	return newVirtioNetworkDeviceConfiguration(fileAttachment, macStr)
 }
 
-func shmemBusExperiment() (controlSock string, enabled bool) {
-	controlSock = os.Getenv("LIMA_VZ_SHMEM_BUS_CONTROL")
-	if controlSock == "" {
-		return "", false
+// The product bus is discovered per managed network. A missing socket means
+// a legacy-only daemon is in use and the caller may use its framed listener;
+// a present but invalid path is a configuration error.
+func shmemBusControlForNetwork(cfg *networks.Config, name string) (string, bool, error) {
+	return probeShmemBusControl(cfg.SockShm(name))
+}
+
+func probeShmemBusControl(controlSock string) (string, bool, error) {
+	info, err := os.Lstat(controlSock)
+	if errors.Is(err, os.ErrNotExist) {
+		return controlSock, false, nil
 	}
-	return controlSock, true
+	if err != nil {
+		return "", false, fmt.Errorf("inspect shared-memory bus socket %q: %w", controlSock, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return "", false, fmt.Errorf("shared-memory bus path %q exists but is not a socket", controlSock)
+	}
+	return controlSock, true, nil
 }
 
 func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, macStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
@@ -436,7 +449,6 @@ func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, 
 
 func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.VirtualMachineConfiguration) error {
 	var configurations []*vz.VirtioNetworkDeviceConfiguration
-	busControl, busEnabled := shmemBusExperiment()
 
 	// Configure default usernetwork with limayaml.MACAddress(inst.Dir) for eth0 interface
 	firstUsernetIndex := limayaml.FirstUsernetIndex(inst.Config)
@@ -521,6 +533,10 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 				if runtime.GOOS != "darwin" {
 					return fmt.Errorf("networks.yaml '%s' configuration is only supported on macOS right now", nw.Lima)
 				}
+				busControl, busEnabled, err := shmemBusControlForNetwork(&nwCfg, nw.Lima)
+				if err != nil {
+					return err
+				}
 				if busEnabled {
 					clientFile, err := DialShmemBus(ctx, busControl, nw.MACAddress)
 					if err != nil {
@@ -534,6 +550,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 					configurations = append(configurations, networkConfig)
 					continue
 				}
+				logrus.Warnf("Shared-memory bus socket %q is absent for network %q; falling back to legacy framed socket %q", busControl, nw.Lima, nwCfg.Sock(nw.Lima))
 				socketVMNetOk, err := nwCfg.IsDaemonInstalled(networks.SocketVMNet)
 				if err != nil {
 					return err
@@ -557,6 +574,28 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 				}
 			}
 		} else if nw.Socket != "" {
+			busControl, err := networks.SockShmFromLegacy(nw.Socket)
+			if err != nil {
+				return err
+			}
+			busControl, busEnabled, err := probeShmemBusControl(busControl)
+			if err != nil {
+				return err
+			}
+			if busEnabled {
+				clientFile, err := DialShmemBus(ctx, busControl, nw.MACAddress)
+				if err != nil {
+					return err
+				}
+				networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
+				if err != nil {
+					return err
+				}
+				logrus.Infof("Attached VZ socket network %q to in-process shared-memory bus %q", nw.Socket, busControl)
+				configurations = append(configurations, networkConfig)
+				continue
+			}
+			logrus.Warnf("Shared-memory bus socket %q is absent for legacy socket %q; falling back to framed transport", busControl, nw.Socket)
 			clientFile, err := DialQemu(ctx, nw.Socket)
 			if err != nil {
 				return err

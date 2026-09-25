@@ -15,8 +15,9 @@ import (
 
 func TestResolveNetworkMTU(t *testing.T) {
 	configured := map[string]networks.Network{
-		"cc":   {Mode: networks.ModeShared, MTU: 9000},
-		"prod": {Mode: networks.ModeHost, MTU: 4096},
+		"cc":            {Mode: networks.ModeShared, MTU: 9000},
+		"prod":          {Mode: networks.ModeHost, MTU: 4096},
+		"secure-strict": {Mode: networks.ModeShared, MTU: 16000},
 	}
 
 	mtu, err := ResolveNetworkMTU(limatype.Network{Lima: "cc"}, configured)
@@ -41,8 +42,15 @@ func TestResolveNetworkMTU(t *testing.T) {
 	_, err = ResolveNetworkMTU(limatype.Network{Lima: "cc", MTU: limatype.NewNetworkMTUReference("cc.MTU")}, map[string]networks.Network{"cc": {Mode: networks.ModeShared}})
 	assert.ErrorContains(t, err, "has no explicit mtu")
 
-	_, err = ResolveNetworkMTU(limatype.Network{Lima: "cc", MTU: limatype.NewNetworkMTU(9000)}, map[string]networks.Network{"cc": {Mode: networks.ModeShared}})
-	assert.ErrorContains(t, err, "exceeds segment mtu 1500")
+	mtu, err = ResolveNetworkMTU(limatype.Network{Lima: "cc", MTU: limatype.NewNetworkMTU(9000)}, map[string]networks.Network{"cc": {Mode: networks.ModeShared}})
+	assert.NilError(t, err)
+	assert.Equal(t, mtu, uint32(9000))
+
+	// An explicit attachment MTU is not a promise that the segment can carry
+	// it. Leave this cross-layer choice to the user instead of rejecting YAML.
+	mtu, err = ResolveNetworkMTU(limatype.Network{Lima: "secure-strict", MTU: limatype.NewNetworkMTU(16001)}, configured)
+	assert.NilError(t, err)
+	assert.Equal(t, mtu, uint32(16001))
 
 	_, err = ResolveNetworkMTU(limatype.Network{Lima: "missing", MTU: limatype.NewNetworkMTUReference("missing.MTU")}, configured)
 	assert.ErrorContains(t, err, "not defined in networks.yaml")
@@ -64,11 +72,14 @@ func TestResolveNetworkMTUFromYAMLScalars(t *testing.T) {
   mtu: 2048
 - lima: referenced
   mtu: referenced.MTU
+- lima: secure-strict
+  mtu: 16001
 `), &cfg)
 	assert.NilError(t, err)
 	configured := map[string]networks.Network{
-		"numeric":    {Mode: networks.ModeShared, MTU: 9000},
-		"referenced": {Mode: networks.ModeShared, MTU: 4096},
+		"numeric":       {Mode: networks.ModeShared, MTU: 9000},
+		"referenced":    {Mode: networks.ModeShared, MTU: 4096},
+		"secure-strict": {Mode: networks.ModeShared, MTU: 16000},
 	}
 	mtu, err := ResolveNetworkMTU(cfg.Networks[0], configured)
 	assert.NilError(t, err)
@@ -76,4 +87,7 @@ func TestResolveNetworkMTUFromYAMLScalars(t *testing.T) {
 	mtu, err = ResolveNetworkMTU(cfg.Networks[1], configured)
 	assert.NilError(t, err)
 	assert.Equal(t, mtu, uint32(4096))
+	mtu, err = ResolveNetworkMTU(cfg.Networks[2], configured)
+	assert.NilError(t, err)
+	assert.Equal(t, mtu, uint32(16001))
 }

@@ -19,10 +19,6 @@ func ResolveNetworkMTU(nw limatype.Network, configured map[string]networks.Netwo
 	if !ok {
 		return 0, fmt.Errorf("lima network %q is not defined in networks.yaml", nw.Lima)
 	}
-	segmentMTU := segment.MTU
-	if segmentMTU == 0 {
-		segmentMTU = networks.DefaultMTU
-	}
 	if nw.MTU == nil {
 		return networks.DefaultMTU, nil
 	}
@@ -51,9 +47,6 @@ func ResolveNetworkMTU(nw limatype.Network, configured map[string]networks.Netwo
 
 	if mtu < networks.MinMTU || mtu > networks.MaxMTU {
 		return 0, fmt.Errorf("numeric mtu %d must be between %d and %d", mtu, networks.MinMTU, networks.MaxMTU)
-	}
-	if mtu > segmentMTU {
-		return 0, fmt.Errorf("numeric mtu %d exceeds segment mtu %d for network %q", mtu, segmentMTU, nw.Lima)
 	}
 	return mtu, nil
 }

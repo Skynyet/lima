@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/lima-vm/lima/v2/pkg/limatype/dirnames"
 	"github.com/lima-vm/lima/v2/pkg/osutil"
@@ -67,6 +68,27 @@ func (c *Config) IsDaemonInstalled(daemon string) (bool, error) {
 // Sock returns a socket_vmnet socket.
 func (c *Config) Sock(name string) string {
 	return filepath.Join(c.Paths.VarRun, fmt.Sprintf("socket_vmnet.%s", name))
+}
+
+// SockShm is the bus control socket for a managed network. Keep its name
+// derived from the same directory and network name as Sock, without parsing
+// an already-assembled filesystem path.
+func (c *Config) SockShm(name string) string {
+	return filepath.Join(c.Paths.VarRun, fmt.Sprintf("socket_vmnet_shm.%s", name))
+}
+
+// SockShmFromLegacy applies the daemon's basename rule to an unmanaged
+// socket path, where Lima has no network name or VarRun components to use.
+func SockShmFromLegacy(socketPath string) (string, error) {
+	dir, base := filepath.Split(socketPath)
+	if base == "" {
+		return "", fmt.Errorf("legacy socket path %q has no filename", socketPath)
+	}
+	stem, suffix := base, ""
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		stem, suffix = base[:dot], base[dot:]
+	}
+	return filepath.Join(dir, stem+"_shm"+suffix), nil
 }
 
 func (c *Config) PIDFile(name, daemon string) string {
