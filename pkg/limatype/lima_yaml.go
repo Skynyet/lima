@@ -333,7 +333,7 @@ type Network struct {
 	// MTU of the guest interface. Requires a socket_vmnet that can carry it:
 	// the segment's MTU is vmnet's, and a guest advertising more than the
 	// segment carries loses every large frame silently.
-	MTU *uint32 `yaml:"mtu,omitempty" json:"mtu,omitempty"`
+	MTU *NetworkMTU `yaml:"mtu,omitempty" json:"mtu,omitempty"`
 }
 
 type HostResolver struct {

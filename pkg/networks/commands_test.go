@@ -6,6 +6,7 @@ package networks
 import (
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -82,6 +83,11 @@ func TestStartCmd(t *testing.T) {
 		cmd := config.StartCmd("shared", SocketVMNet)
 		assert.Equal(t, cmd, "/opt/socket_vmnet/bin/socket_vmnet --pidfile="+filepath.Join(varRunDir, "shared_socket_vmnet.pid")+" --socket-group=admin --vmnet-mode=shared "+
 			"--vmnet-gateway=192.168.105.1 --vmnet-dhcp-end=192.168.105.254 --vmnet-mask=255.255.255.0 "+filepath.Join(varRunDir, "socket_vmnet.shared"))
+		shared := config.Networks["shared"]
+		shared.MTU = 9000
+		config.Networks["shared"] = shared
+		cmd = config.StartCmd("shared", SocketVMNet)
+		assert.Assert(t, strings.Contains(cmd, " --vmnet-mtu=9000 "))
 
 		cmd = config.StartCmd("bridged", SocketVMNet)
 		assert.Equal(t, cmd, "/opt/socket_vmnet/bin/socket_vmnet --pidfile="+filepath.Join(varRunDir, "bridged_socket_vmnet.pid")+" --socket-group=admin --vmnet-mode=bridged "+

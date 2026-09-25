@@ -394,14 +394,6 @@ func newVirtioFileNetworkDeviceConfigurationWithMTU(file *os.File, macStr string
 	return newVirtioFileNetworkDeviceConfigurationMTU(file, macStr, uint32(mtu))
 }
 
-// A nil MTU means "leave it alone", which is what every existing instance has.
-func mtuOf(nw limatype.Network) uint32 {
-	if nw.MTU == nil {
-		return 0
-	}
-	return *nw.MTU
-}
-
 // A nil MTU preserves the existing attachment behavior. user-v2's management
 // network uses a netstack fixed at 1500.
 func newVirtioFileNetworkDeviceConfigurationMTU(file *os.File, macStr string, mtu uint32) (*vz.VirtioNetworkDeviceConfiguration, error) {
@@ -525,12 +517,20 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 				if err != nil {
 					return err
 				}
-				networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
+				networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
 				if err != nil {
 					return err
 				}
 				configurations = append(configurations, networkConfig)
 			} else {
+				attachmentMTU, err := limayaml.ResolveNetworkMTU(nw, nwCfg.Networks)
+				if err != nil {
+					return fmt.Errorf("resolve MTU for network %q: %w", nw.Lima, err)
+				}
+				if nw.MTU == nil {
+					// Keep the pre-feature VZ call path for an omitted MTU.
+					attachmentMTU = 0
+				}
 				if runtime.GOOS != "darwin" {
 					return fmt.Errorf("networks.yaml '%s' configuration is only supported on macOS right now", nw.Lima)
 				}
@@ -562,7 +562,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 					if err != nil {
 						return err
 					}
-					networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
+					networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, attachmentMTU)
 					if err != nil {
 						return err
 					}
@@ -574,7 +574,7 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 			if err != nil {
 				return err
 			}
-			networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, mtuOf(nw))
+			networkConfig, err := newVirtioFileNetworkDeviceConfiguration(clientFile, nw.MACAddress)
 			if err != nil {
 				return err
 			}
