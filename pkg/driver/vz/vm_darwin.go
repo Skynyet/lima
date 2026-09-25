@@ -390,10 +390,6 @@ func newVirtioFileNetworkDeviceConfiguration(file *os.File, macStr string) (*vz.
 	return newVirtioFileNetworkDeviceConfigurationMTU(file, macStr, 0)
 }
 
-func newVirtioFileNetworkDeviceConfigurationWithMTU(file *os.File, macStr string, mtu int) (*vz.VirtioNetworkDeviceConfiguration, error) {
-	return newVirtioFileNetworkDeviceConfigurationMTU(file, macStr, uint32(mtu))
-}
-
 // A nil MTU preserves the existing attachment behavior. user-v2's management
 // network uses a netstack fixed at 1500.
 func newVirtioFileNetworkDeviceConfigurationMTU(file *os.File, macStr string, mtu uint32) (*vz.VirtioNetworkDeviceConfiguration, error) {
@@ -413,19 +409,12 @@ func newVirtioFileNetworkDeviceConfigurationMTU(file *os.File, macStr string, mt
 	return newVirtioNetworkDeviceConfiguration(fileAttachment, macStr)
 }
 
-func shmemBusExperiment() (controlSock string, mtu int, enabled bool, err error) {
+func shmemBusExperiment() (controlSock string, enabled bool) {
 	controlSock = os.Getenv("LIMA_VZ_SHMEM_BUS_CONTROL")
 	if controlSock == "" {
-		return "", 0, false, nil
+		return "", false
 	}
-	mtu = 1500
-	if text := os.Getenv("LIMA_VZ_SHMEM_BUS_MTU"); text != "" {
-		mtu, err = strconv.Atoi(text)
-		if err != nil || mtu < 1500 || mtu > 65535 {
-			return "", 0, false, fmt.Errorf("invalid LIMA_VZ_SHMEM_BUS_MTU %q (want 1500..65535)", text)
-		}
-	}
-	return controlSock, mtu, true, nil
+	return controlSock, true
 }
 
 func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, macStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
@@ -447,10 +436,7 @@ func newVirtioNetworkDeviceConfiguration(attachment vz.NetworkDeviceAttachment, 
 
 func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.VirtualMachineConfiguration) error {
 	var configurations []*vz.VirtioNetworkDeviceConfiguration
-	busControl, busMTU, busEnabled, err := shmemBusExperiment()
-	if err != nil {
-		return err
-	}
+	busControl, busEnabled := shmemBusExperiment()
 
 	// Configure default usernetwork with limayaml.MACAddress(inst.Dir) for eth0 interface
 	firstUsernetIndex := limayaml.FirstUsernetIndex(inst.Config)
@@ -523,10 +509,11 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 				}
 				configurations = append(configurations, networkConfig)
 			} else {
-				attachmentMTU, err := limayaml.ResolveNetworkMTU(nw, nwCfg.Networks)
+				effectiveMTU, err := limayaml.ResolveNetworkMTU(nw, nwCfg.Networks)
 				if err != nil {
 					return fmt.Errorf("resolve MTU for network %q: %w", nw.Lima, err)
 				}
+				attachmentMTU := effectiveMTU
 				if nw.MTU == nil {
 					// Keep the pre-feature VZ call path for an omitted MTU.
 					attachmentMTU = 0
@@ -539,11 +526,11 @@ func attachNetwork(ctx context.Context, inst *limatype.Instance, vmConfig *vz.Vi
 					if err != nil {
 						return err
 					}
-					networkConfig, err := newVirtioFileNetworkDeviceConfigurationWithMTU(clientFile, nw.MACAddress, busMTU)
+					networkConfig, err := newVirtioFileNetworkDeviceConfigurationMTU(clientFile, nw.MACAddress, attachmentMTU)
 					if err != nil {
 						return err
 					}
-					logrus.Infof("Attached VZ network %q to in-process shared-memory bus %q (MTU %d)", nw.Lima, busControl, busMTU)
+					logrus.Infof("Attached VZ network %q to in-process shared-memory bus %q (MTU %d)", nw.Lima, busControl, effectiveMTU)
 					configurations = append(configurations, networkConfig)
 					continue
 				}
