@@ -48,6 +48,14 @@ type Stats struct {
 	EgressFiltered      uint64 `json:"egress_filtered"`
 	EgressWouldBlock    uint64 `json:"egress_would_block"`
 	ClaimRetryExhausted uint64 `json:"claim_retry_exhausted"`
+	IngressSyscalls     uint64 `json:"ingress_syscalls"`
+	IngressBatchFrames  uint64 `json:"ingress_batch_frames"`
+	IngressTruncated    uint64 `json:"ingress_truncated"`
+	EgressSyscalls      uint64 `json:"egress_syscalls"`
+	EgressBatchFrames   uint64 `json:"egress_batch_frames"`
+	EgressPartial       uint64 `json:"egress_partial"`
+	EgressENOBUFS       uint64 `json:"egress_enobufs"`
+	BatchFallbacks      uint64 `json:"batch_fallbacks"`
 }
 
 type source struct {
@@ -78,7 +86,8 @@ type Peer struct {
 	controlStarted bool
 	membership     ring.MembershipSnapshot
 	membershipOK   bool
-	dropBuf        []byte
+	frameScratch   [][]byte
+	batch          edgeBatchState
 	stopping       atomic.Bool
 	stats          Stats
 }
@@ -132,8 +141,10 @@ func Open(cfg Config) (*Peer, error) {
 
 	p := &Peer{cfg: cfg, client: c, ownRing: ownRing, ownState: ownState,
 		directory: directory, edge: edge, kqueue: -1, wakeR: -1, wakeW: -1,
-		control:     make(chan controlResult, ring.MaxPorts*2),
-		controlDone: make(chan struct{}), dropBuf: make([]byte, cfg.MaxFrame)}
+		control:      make(chan controlResult, ring.MaxPorts*2),
+		controlDone:  make(chan struct{}),
+		frameScratch: make([][]byte, 0, edgeBatchCap)}
+	p.batch.init(cfg.MaxFrame)
 	p.stats.Port = c.Port
 	for port, capability := range c.Peers {
 		if err := p.install(port, capability); err != nil {
@@ -285,6 +296,17 @@ func (p *Peer) Run() (Stats, error) {
 			remaining = syscall.NsecToTimespec(d.Nanoseconds())
 			timeout = &remaining
 		}
+		var retry syscall.Timespec
+		if len(p.batch.pending) != 0 && p.batch.blocked == edgeNoBuffers {
+			d := time.Until(p.batch.retryAt)
+			if d < 0 {
+				d = 0
+			}
+			retry = syscall.NsecToTimespec(d.Nanoseconds())
+			if timeout == nil || d < time.Duration(remaining.Nano()) {
+				timeout = &retry
+			}
+		}
 		n, err := syscall.Kevent(p.kqueue, nil, events, timeout)
 		if err == syscall.EINTR {
 			continue
@@ -292,13 +314,24 @@ func (p *Peer) Run() (Stats, error) {
 		if err != nil {
 			return p.stats, err
 		}
-		if n == 0 && !deadline.IsZero() {
-			break
+		if n == 0 {
+			if len(p.batch.pending) != 0 && p.batch.blocked == edgeNoBuffers {
+				p.batch.blocked = edgeNotBlocked
+				continue
+			}
+			if !deadline.IsZero() && !time.Now().Before(deadline) {
+				break
+			}
 		}
 		for i := 0; i < n; i++ {
 			switch int(events[i].Ident) {
 			case p.edge:
-				edgeReady = true
+				switch events[i].Filter {
+				case syscall.EVFILT_READ:
+					edgeReady = true
+				case syscall.EVFILT_WRITE:
+					p.batch.blocked = edgeNotBlocked
+				}
 			case p.client.DoorbellRx:
 				p.drainFD(p.client.DoorbellRx)
 			case p.wakeR:
@@ -377,51 +410,97 @@ func (p *Peer) produce() error {
 		}
 		states[port] = s.state
 	}
-	var reservation ring.Reservation
-	ok, err := p.ownRing.TryReserveInto(&reservation, states[:], p.pinMask)
+
+	// Receive before reserving ring space. Unlike the old zero-copy Read path,
+	// private batch storage lets an empty nonblocking call return without
+	// publishing an empty slot. One event handles at most edgeBatchCap frames;
+	// kqueue remains level-triggered if more are queued, which is the fairness
+	// bound the old drain-to-EAGAIN proposal lacked.
+	count, err := p.recvEdge(edgeBatchCap)
+	if isWouldBlock(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if !ok {
-		// TryReserve advanced head past an unpublished sequence. A consumer
-		// asleep at that sequence needs a hint before it can classify the hole
-		// and advance; this rare failure path deliberately rings every target.
-		if err := p.ringTargets(targets); err != nil {
-			return err
-		}
-		return p.discardIngress()
+	if count == 0 {
+		return nil
 	}
 
-	frames := uint64(0)
-	bytes := uint64(0)
-	for {
-		buf, err := reservation.FrameBuffer()
-		if err != nil || len(buf) < p.cfg.MaxFrame {
-			break
-		}
-		n, err := syscall.Read(p.edge, buf)
-		if isWouldBlock(err) {
-			break
-		}
-		if err != nil {
-			if publishErr := reservation.PublishDirect(snapshot.Epoch); publishErr != nil {
-				return publishErr
-			}
-			return err
-		}
-		if n < 14 {
-			if err := reservation.CommitFrame(uint32(n), 0, 0); err != nil {
-				return err
-			}
+	var reservation ring.Reservation
+	reserved := false
+	slotRecords := uint64(0)
+	slotFrames := uint64(0)
+	slotBytes := uint64(0)
+	for i := 0; i < count; i++ {
+		if p.batch.recvBad[i] {
 			continue
 		}
-		if err := reservation.CommitFrame(uint32(n), 0, targets); err != nil {
-			return err
+		length := p.batch.recvLen[i]
+		for {
+			if !reserved {
+				ok, reserveErr := p.ownRing.TryReserveInto(&reservation, states[:], p.pinMask)
+				if reserveErr != nil {
+					return reserveErr
+				}
+				if !ok {
+					for j := i; j < count; j++ {
+						if !p.batch.recvBad[j] && p.batch.recvLen[j] > 0 {
+							p.stats.ReserveDrops++
+						}
+					}
+					// TryReserve advanced head past an unpublished sequence. A
+					// sleeping consumer needs a hint to classify that hole.
+					if err := p.ringTargets(targets); err != nil {
+						return err
+					}
+					return p.discardIngress()
+				}
+				reserved = true
+				slotRecords = 0
+				slotFrames = 0
+				slotBytes = 0
+			}
+
+			buf, bufferErr := reservation.FrameBuffer()
+			if bufferErr == nil && length <= len(buf) {
+				copy(buf[:length], p.batch.recvBuf[i][:length])
+				mask := targets
+				if length < 14 {
+					mask = 0
+				} else {
+					slotFrames++
+					slotBytes += uint64(length)
+				}
+				if err := reservation.CommitFrame(uint32(length), 0, mask); err != nil {
+					return err
+				}
+				slotRecords++
+				break
+			}
+			if slotRecords == 0 {
+				if bufferErr != nil {
+					return bufferErr
+				}
+				return fmt.Errorf("frame length %d exceeds an empty ring slot", length)
+			}
+			if err := p.publishIngress(&reservation, snapshot.Epoch, targets,
+				states[:], slotFrames, slotBytes); err != nil {
+				return err
+			}
+			reserved = false
 		}
-		frames++
-		bytes += uint64(n)
 	}
-	if err := reservation.PublishDirect(snapshot.Epoch); err != nil {
+	if reserved {
+		return p.publishIngress(&reservation, snapshot.Epoch, targets,
+			states[:], slotFrames, slotBytes)
+	}
+	return nil
+}
+
+func (p *Peer) publishIngress(reservation *ring.Reservation, epoch, targets uint64,
+	states []*ring.ConsumerState, frames, bytes uint64) error {
+	if err := reservation.PublishDirect(epoch); err != nil {
 		return err
 	}
 	p.stats.PublishedSlots++
@@ -431,10 +510,6 @@ func (p *Peer) produce() error {
 	p.stats.IngressFrames += frames
 	p.stats.IngressBytes += bytes
 
-	// Check after publishing. If a consumer's cursor still names this sequence,
-	// it may have observed the old head and gone to sleep, so ring it. A cursor
-	// behind this sequence belongs to a consumer that must walk through the
-	// backlog; a cursor ahead belongs to one that already saw the publication.
 	caughtUp := uint64(0)
 	for mask := targets; mask != 0; mask &= mask - 1 {
 		port := uint32(bits.TrailingZeros64(mask))
@@ -466,21 +541,34 @@ func (p *Peer) ringTargets(targets uint64) error {
 }
 
 func (p *Peer) discardIngress() error {
-	for {
-		n, err := syscall.Read(p.edge, p.dropBuf)
+	// Keep the exceptional drop path bounded too. The edge is level-triggered,
+	// so another event follows when more data remains; one peer cannot hold the
+	// event loop forever merely because it currently has no targets or ring
+	// capacity.
+	for batch := 0; batch < edgeDrainBatchLimit; batch++ {
+		n, err := p.recvEdge(edgeBatchCap)
 		if isWouldBlock(err) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if n > 0 {
-			p.stats.ReserveDrops++
+		for i := 0; i < n; i++ {
+			if !p.batch.recvBad[i] && p.batch.recvLen[i] > 0 {
+				p.stats.ReserveDrops++
+			}
 		}
 	}
+	return nil
 }
 
 func (p *Peer) consume() error {
+	if err := p.flushHeldEgress(); err != nil {
+		return err
+	}
+	if len(p.batch.pending) != 0 {
+		return nil
+	}
 	snapshot, err := p.snapshot()
 	if err != nil {
 		return nil
@@ -528,13 +616,11 @@ func (p *Peer) consumeSource(port uint32, source *source, snapshot *ring.Members
 		}
 		switch status {
 		case ring.ClaimReady:
-			visitErr := claim.Records(p.deliver)
-			releaseErr := claim.Release(true)
-			if visitErr != nil {
-				return visitErr
+			if err := p.deliverClaim(&claim); err != nil {
+				return err
 			}
-			if releaseErr != nil {
-				return releaseErr
+			if len(p.batch.pending) != 0 {
+				return nil
 			}
 		case ring.ClaimReclaiming:
 			if err := p.ownState.SkipClaimRetry(port, cursor); err != nil {
@@ -579,25 +665,33 @@ func (p *Peer) pinMask(publishEpoch, targets uint64) (uint64, error) {
 	return snapshot.Pins(publishEpoch, targets), nil
 }
 
-func (p *Peer) deliver(frame ring.Frame) error {
-	if !accepts(frame.Bytes, p.cfg.MAC) {
-		p.stats.EgressFiltered++
+func (p *Peer) deliverClaim(claim *ring.Claim) error {
+	p.frameScratch = p.frameScratch[:0]
+	if err := claim.Records(func(frame ring.Frame) error {
+		if !accepts(frame.Bytes, p.cfg.MAC) {
+			p.stats.EgressFiltered++
+			return nil
+		}
+		p.frameScratch = append(p.frameScratch, frame.Bytes)
 		return nil
-	}
-	n, err := syscall.Write(p.edge, frame.Bytes)
-	if isWouldBlock(err) || err == syscall.ENOBUFS {
-		p.stats.EgressWouldBlock++
-		return nil
-	}
-	if err != nil {
+	}); err != nil {
+		_ = claim.Release(true)
 		return err
 	}
-	if n != len(frame.Bytes) {
-		return fmt.Errorf("short datagram send: %d of %d", n, len(frame.Bytes))
+
+	sent, blocked, sendErr := p.sendFrames(p.frameScratch)
+	var holdErr error
+	if sendErr == nil && blocked != edgeNotBlocked {
+		holdErr = p.holdEgress(p.frameScratch[sent:], blocked)
 	}
-	p.stats.EgressFrames++
-	p.stats.EgressBytes += uint64(n)
-	return nil
+	releaseErr := claim.Release(true)
+	if sendErr != nil {
+		return sendErr
+	}
+	if holdErr != nil {
+		return holdErr
+	}
+	return releaseErr
 }
 
 func accepts(frame []byte, mac uint64) bool {
