@@ -1,105 +1,34 @@
-[[🌎**Web site**]](https://lima-vm.io/)
-[[📖**Documentation**]](https://lima-vm.io/docs/)
-[[👤**Slack (`#lima`)**]](https://slack.cncf.io)
+# SkyNyet Lima: shared-memory networking for VZ guests
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="website/static/images/logo-dark.svg">
-  <img alt="Shows a stylized 'Lima' text in bold, modern font" src="website/static/images/logo.svg" width=400 />
-</picture>
+[Русская версия](README.ru.md)
 
-# Lima: Linux Machines
+This proof of concept (PoC) is a pair of forks based on [Lima v2.2.0](https://github.com/lima-vm/lima/blob/v2.2.0/README.md) and [socket_vmnet v1.2.2](https://github.com/lima-vm/socket_vmnet/blob/v1.2.2/README.md). They are not official releases.
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lima-vm/lima)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/6505/badge)](https://www.bestpractices.dev/projects/6505)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lima-vm/lima/badge)](https://scorecard.dev/viewer/?uri=github.com/lima-vm/lima)
+## Why
 
-[Lima](https://lima-vm.io/) launches Linux virtual machines with automatic file sharing and port forwarding (similar to WSL2).
+The main motivation is to speed up vanilla shared networking. When two VMs exchange traffic, relaying every Ethernet frame through a stream socket adds process switches, copies, and syscalls to traffic that does not need vmnet at all.
 
-The original goal of Lima was to promote [containerd](https://containerd.io) including [nerdctl (contaiNERD ctl)](https://github.com/containerd/nerdctl)
-to Mac users, but Lima can be used for non-container applications as well.
+The first version used a separate shared-memory bus coordinator; it now lives *inside* `socket_vmnet`. Lima automatically connects each VZ guest's hostagent to the bus through an additional Unix control socket. VM-to-VM frames travel directly through shared-memory rings, while the daemon serves as the vmnet uplink for host and external connectivity. For a Lima network named `shared`, the bus socket is `socket_vmnet_shm.shared`, beside the original `socket_vmnet.shared`.
 
-Lima also supports other container engines (Docker, Podman, Kubernetes, etc.) and non-macOS hosts (Linux, NetBSD, etc.).
+## Features and fixes
 
-## Getting started
-Set up (Homebrew):
-```bash
-brew install lima
-limactl start
-```
+- **Automatic bus attachment and fallback.** Lima finds the bus socket for VZ guests without a special flag. If it is absent, Lima warns and uses the existing framed path; if it is present but the connection fails, Lima reports an error.
+- **One stalled VM does not block the others.** Each hostagent reads its own ring independently. A recipient holding a full slot may cause a frame to be dropped, but other participants do not wait for its socket.
+- **Recovery without restarting the VM.** After a coordinator restart, the hostagent rejoins the bus. A stalled join can be cancelled when the VM stops.
+- **Independent MTUs.** Lima sets the `socket_vmnet` segment MTU and a VZ network attachment's MTU separately. A VM's MTU may be numeric or refer to the network MTU; it is deliberately allowed to differ from the bus MTU, for example when testing PMTU discovery.
+- **Batched VZ edge.** Darwin `recvmsg_x`/`sendmsg_x` process frames in batches in both directions; ordinary datagram operations remain available when those calls are not.
 
-To run Linux commands:
-```bash
-lima uname -a
-```
+## Performance
 
-To run containers with containerd:
-```bash
-lima nerdctl run --rm hello-world
-```
+- At MTU 1500, vanilla Lima with upstream `socket_vmnet` delivered 2.38 Gbps between two VMs; the shared-memory bus reached 9.88 Gbps (23.4 Gbps at MTU 9000).
+- With the vmnet uplink present, two VMs sustained about 5.67 Gbps **in each direction (bidir)** at MTU 1500, with four TCP streams per direction.
+- Stopping and rejoining an idle third VM left a concurrent host-to-VM transfer at 7.91, 7.84, and 7.72 Gbps. The two guests also kept exchanging traffic after the vmnet uplink was retired.
+- VZ-edge batching cut hostagent CPU per GB by 30.2%.
 
-To run containers with Docker:
-```bash
-limactl start template:docker
-export DOCKER_HOST=$(limactl list docker --format 'unix://{{.Dir}}/sock/docker.sock')
-docker run --rm hello-world
-```
+The bus fast path serves VZ guests on `socket_vmnet` networks. QEMU, `user-v2`, and VZ NAT do not use it.
 
-To run containers with Kubernetes:
-```bash
-limactl start template:k8s
-export KUBECONFIG=$(limactl list k8s --format 'unix://{{.Dir}}/copied-from-guest/kubeconfig.yaml')
-kubectl apply -f ...
-```
+## Fork authorship
 
-See <https://lima-vm.io/docs/> for the further information.
+Igor Podlesny with AI agents (OpenAI GPT/Codex, Anthropic Claude, xAI Grok, Qwen via OpenCode, and others).
 
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](https://lima-vm.io/docs/community/contributing/) for details on:
-
-- **Developer Certificate of Origin (DCO)**: All commits must be signed off with `git commit -s`
-- Code licensing and pull request guidelines
-- Testing requirements
-
-## Community
-### Adopters
-
-Container environments:
-- [Rancher Desktop](https://rancherdesktop.io/): Kubernetes and container management to the desktop
-- [Colima](https://github.com/abiosoft/colima): Docker (and Kubernetes) on macOS with minimal setup
-- [Finch](https://github.com/runfinch/finch): Finch is a command line client for local container development
-- [Podman Desktop](https://podman-desktop.io/): Podman Desktop GUI has a plug-in for Lima virtual machines
-
-GUI:
-- [Lima xbar plugin](https://github.com/unixorn/lima-xbar-plugin): [xbar](https://xbarapp.com/) plugin to start/stop VMs from the menu bar and see their running status.
-- [lima-gui](https://github.com/afbjorklund/lima-gui): Qt GUI for Lima
-
-### Communication channels
-<!-- Duplicated from https://lima-vm.io/docs/community/ -->
-- [GitHub Discussions](https://github.com/lima-vm/lima/discussions)
-- `#lima` channel in the CNCF Slack
-  - New account: <https://slack.cncf.io/>
-  - Login: <https://cloud-native.slack.com/>
-- Community meetings on Zoom (tentatively monthly)
-  - Meeting notes & agenda proposals: https://github.com/lima-vm/lima/discussions/categories/meetings
-  - Calendar: https://zoom-lfx.platform.linuxfoundation.org/meetings/lima
-
-### Social media accounts
-
-Follow us for project updates, release announcements, and community news:
-
-- https://x.com/@TheLimaProject
-- https://mastodon.social/@TheLimaProject
-
-### Code of Conduct
-Lima follows the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md).
-
-- - -
-**We are a [Cloud Native Computing Foundation](https://cncf.io/) incubating project.**
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://www.cncf.io/wp-content/uploads/2022/07/cncf-white-logo.svg">
-  <img src="https://www.cncf.io/wp-content/uploads/2022/07/cncf-color-bg.svg" width=300 />
-</picture>
-
-The Linux Foundation® (TLF) has registered trademarks and uses trademarks. For a list of TLF trademarks, see [Trademark Usage](https://www.linuxfoundation.org/legal/trademark-usage).
+Original Lima and socket_vmnet authorship and licenses are preserved.
